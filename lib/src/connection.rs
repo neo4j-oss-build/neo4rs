@@ -1,9 +1,12 @@
 #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
 use crate::bolt::{
-    ExpectedResponse, Hello, HelloBuilder, Message, MessageResponse, Reset, Summary,
+    ExpectedResponse, Hello, HelloBuilder, Message, MessageResponse, MessageResponseRef, Reset,
+    Summary,
 };
 #[cfg(not(feature = "unstable-bolt-protocol-impl-v2"))]
 use crate::messages::HelloBuilder;
+#[cfg(feature = "unstable-bolt-protocol-impl-v2")]
+use crate::packstream::Data;
 use crate::{
     auth::ClientCertificate,
     connection::stream::ConnectionStream,
@@ -34,6 +37,9 @@ const MAX_CHUNK_SIZE: usize = 65_535 - mem::size_of::<u16>();
 pub struct Connection {
     version: Version,
     stream: BufStream<ConnectionStream>,
+
+    #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
+    last_result: Data,
 }
 
 impl Connection {
@@ -78,6 +84,8 @@ impl Connection {
         Connection {
             version,
             stream: BufStream::new(stream.into()),
+            #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
+            last_result: Data::new(Bytes::new()),
         }
     }
 
@@ -170,6 +178,19 @@ impl Connection {
     pub(crate) async fn recv_as<T: MessageResponse>(&mut self) -> Result<T> {
         let bytes = self.recv_bytes().await?;
         Ok(T::parse(bytes)?)
+    }
+
+    #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
+    #[allow(unused)]
+    pub(crate) async fn recv_as_ref<'this, T: MessageResponseRef<'this> + 'this>(
+        &'this mut self,
+    ) -> Result<T> {
+        let bytes = self.recv_bytes().await?;
+        let _previous_bytes = self.last_result.reset_to(bytes);
+        #[cfg(debug_assertions)]
+        Self::dbg("drop", &_previous_bytes);
+
+        Ok(T::parse_ref(&mut self.last_result)?)
     }
 
     async fn send_bytes(&mut self, bytes: Bytes) -> Result<()> {

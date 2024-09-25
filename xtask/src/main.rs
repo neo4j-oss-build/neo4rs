@@ -62,41 +62,18 @@ fn update_msrv_lock() -> Result {
         .read()
     }?;
 
-    let pin_versions: [(String, &str); 0] = [];
-
     cmd!(sh, "rm {lockfile}").run_if(dry_run)?;
 
+    let pin_versions: [(String, &str); 0] = [];
     for (krate, version) in pin_versions {
-        cmd!(sh, "{cargo} update --package {krate} --precise {version}").run_if(dry_run)?;
+        pin_version(dry_run, &sh, &cargo, &krate, version)?;
     }
 
     cmd!(sh, "cargo +{msrv} test --no-run --all-features").run_if(dry_run)?;
 
     cmd!(sh, "cp {lockfile} {ci_dir}/Cargo.lock.msrv").run_if(dry_run)?;
 
-    return Ok(());
-
-    fn latest_version(sh: &Shell, krate: &str) -> Result<String> {
-        let index = match krate.len() {
-            1 => format!("https://index.crates.io/1/{}", krate),
-            2 => format!("https://index.crates.io/2/{}", krate),
-            3 => format!("https://index.crates.io/3/{}/{}", &krate[..1], krate),
-            _ => format!(
-                "https://index.crates.io/{}/{}/{}",
-                &krate[..2],
-                &krate[2..4],
-                krate
-            ),
-        };
-
-        let index = cmd!(sh, "curl --silent {index}").read()?;
-
-        let version = cmd!(sh, "jq --slurp --raw-output 'map(.vers) | last'")
-            .stdin(index)
-            .read()?;
-
-        Ok(format!("{krate}@{version}"))
-    }
+    Ok(())
 }
 
 fn update_min_lock() -> Result {
@@ -108,8 +85,11 @@ fn update_min_lock() -> Result {
     } = task_env();
 
     let sh = Shell::new()?;
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
     cmd!(sh, "rm {lockfile}").run_if(dry_run)?;
+
+    pin_version(dry_run, &sh, &cargo, "ahash", "0.8.7")?;
 
     cmd!(
         sh,
@@ -121,6 +101,33 @@ fn update_min_lock() -> Result {
     cmd!(sh, "cp {lockfile} {ci_dir}/Cargo.lock.min").run_if(dry_run)?;
 
     Ok(())
+}
+
+fn pin_version(dry_run: bool, sh: &Shell, cargo: &str, krate: &str, version: &str) -> Result<()> {
+    cmd!(sh, "{cargo} update --package {krate} --precise {version}").run_if(dry_run)?;
+    Ok(())
+}
+
+fn latest_version(sh: &Shell, krate: &str) -> Result<String> {
+    let index = match krate.len() {
+        1 => format!("https://index.crates.io/1/{}", krate),
+        2 => format!("https://index.crates.io/2/{}", krate),
+        3 => format!("https://index.crates.io/3/{}/{}", &krate[..1], krate),
+        _ => format!(
+            "https://index.crates.io/{}/{}/{}",
+            &krate[..2],
+            &krate[2..4],
+            krate
+        ),
+    };
+
+    let index = cmd!(sh, "curl --silent {index}").read()?;
+
+    let version = cmd!(sh, "jq --slurp --raw-output 'map(.vers) | last'")
+        .stdin(index)
+        .read()?;
+
+    Ok(format!("{krate}@{version}"))
 }
 
 struct Env {

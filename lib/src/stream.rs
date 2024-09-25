@@ -4,7 +4,7 @@ use crate::messages::{BoltRequest, BoltResponse};
 use crate::summary::{ResultSummary, Streaming};
 #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
 use crate::{
-    bolt::{Bolt, Discard, Pull, Response, Summary, WrapExtra as _},
+    bolt::{Bolt, BoltRef, Discard, Pull, Response, Summary, WrapExtra as _},
     BoltType,
 };
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
 use futures::{stream::try_unfold, TryStream};
 use serde::de::DeserializeOwned;
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc, sync::OnceLock};
 
 #[cfg(feature = "unstable-result-summary")]
 type BoxedSummary = Box<ResultSummary>;
@@ -42,7 +42,7 @@ pub struct RowStream {
     available_after: i64,
     state: State,
     fetch_size: usize,
-    buffer: VecDeque<Row>,
+    buffer: VecDeque<BoltList>,
 }
 
 impl RowStream {
@@ -139,7 +139,8 @@ impl RowStream {
         mut handle: impl TransactionHandle,
     ) -> Result<Option<RowItem>> {
         loop {
-            if let Some(row) = self.buffer.pop_front() {
+            if let Some(record) = self.buffer.pop_front() {
+                let row = Row::new(self.fields.clone(), record);
                 return Ok(Some(RowItem::Row(row)));
             }
 
@@ -161,8 +162,7 @@ impl RowStream {
                                         .map(BoltType::from)
                                         .collect::<Vec<BoltType>>(),
                                 );
-                                let row = Row::new(self.fields.clone(), record);
-                                self.buffer.push_back(row);
+                                self.buffer.push_back(record);
                             }
                             Response::Success(Streaming::HasMore) => break State::Ready,
                             Response::Success(Streaming::Done(mut s)) => {
@@ -197,8 +197,7 @@ impl RowStream {
                                 };
                             }
                             Ok(BoltResponse::Record(record)) => {
-                                let row = Row::new(self.fields.clone(), record.data);
-                                self.buffer.push_back(row);
+                                self.buffer.push_back(record.data);
                             }
                             Ok(msg) => return Err(msg.into_error("PULL")),
                             Err(e) => return Err(e),
@@ -383,6 +382,114 @@ impl RowStream {
             }
         })
     }
+
+    #[cfg(all(
+        feature = "polars_v0_43",
+        not(feature = "unstable-result-summary"),
+        feature = "unstable-bolt-protocol-impl-v2"
+    ))]
+    pub async fn into_dataframe(
+        self,
+        mut handle: impl TransactionHandle,
+    ) -> Result<polars::frame::DataFrame> {
+        self.into_df(handle).await
+    }
+
+    #[cfg(all(
+        feature = "polars_v0_43",
+        feature = "unstable-result-summary",
+        feature = "unstable-bolt-protocol-impl-v2"
+    ))]
+    pub async fn into_dataframe(
+        self,
+        handle: impl TransactionHandle,
+    ) -> Result<(polars::frame::DataFrame, Option<ResultSummary>)> {
+        let out_summary = Arc::new(OnceLock::new());
+        let df = self.into_df(handle, out_summary.clone()).await?;
+        let summary = Arc::into_inner(out_summary).and_then(|s| s.into_inner());
+        Ok((df, summary))
+    }
+
+    #[cfg(all(feature = "polars_v0_43", feature = "unstable-bolt-protocol-impl-v2"))]
+    fn into_df(
+        mut self,
+        mut handle: impl TransactionHandle,
+        #[cfg(feature = "unstable-result-summary")] out_summary: Arc<OnceLock<ResultSummary>>,
+    ) -> impl std::future::Future<Output = Result<polars::frame::DataFrame, Error>> {
+        let fields = self.fields.value.iter().filter_map(|x| match x {
+            BoltType::String(s) => Some(s.value.as_str()),
+            _ => None,
+        });
+
+        let mut buf = pl::DataBuf::new(self.fetch_size, fields);
+
+        // TODO
+        //for row in self.buffer.drain(..) {
+        //    buf.push(row.value);
+        //}
+
+        async move {
+            while self.state == State::Ready {
+                #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
+                {
+                    let pull = Pull::some(self.fetch_size as i64).for_query(self.qid);
+                    let connection = handle.connection();
+                    connection.send_as(pull).await?;
+                    self.state = loop {
+                        let response = connection
+                            .recv_as_ref::<Response<Vec<BoltRef<'_>>, Streaming>>()
+                            .await?;
+                        match response {
+                            Response::Detail(record) => {
+                                buf.push(record)?;
+                            }
+                            Response::Success(Streaming::HasMore) => break State::Ready,
+                            Response::Success(Streaming::Done(mut s)) => {
+                                s.set_t_first(self.available_after);
+                                break State::Complete(Some(s));
+                            }
+                            otherwise => return Err(otherwise.into_error("PULL")),
+                        }
+                    };
+                    buf.flush()?;
+                }
+
+                #[cfg(not(feature = "unstable-bolt-protocol-impl-v2"))]
+                {
+                    let pull = BoltRequest::pull(self.fetch_size, self.qid);
+                    let connection = handle.connection();
+                    connection.send(pull).await?;
+
+                    self.state = loop {
+                        match connection.recv().await {
+                            Ok(BoltResponse::Success(s)) => {
+                                break if s.get("has_more").unwrap_or(false) {
+                                    State::Ready
+                                } else {
+                                    State::Complete(None)
+                                };
+                            }
+                            Ok(BoltResponse::Record(record)) => {
+                                buf.push(record.data);
+                            }
+                            Ok(msg) => return Err(msg.into_error("PULL")),
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    buf.flush()?;
+                }
+            }
+
+            #[cfg(feature = "unstable-result-summary")]
+            if let State::Complete(ref mut summary) = self.state {
+                if let Some(summary) = summary.take() {
+                    out_summary.set(*summary).expect("only one summary");
+                };
+            }
+
+            Ok(buf.into_df()?)
+        }
+    }
 }
 
 impl DetachedRowStream {
@@ -470,6 +577,18 @@ impl DetachedRowStream {
     ) -> impl TryStream<Ok = RowItem<T>, Error = Error> + 'this {
         self.stream.column_to_items(&mut self.connection, column)
     }
+
+    #[cfg(all(feature = "polars_v0_43", not(feature = "unstable-result-summary")))]
+    pub async fn into_dataframe(mut self) -> Result<polars::frame::DataFrame> {
+        self.stream.into_dataframe(&mut self.connection).await
+    }
+
+    #[cfg(all(feature = "polars_v0_43", feature = "unstable-result-summary"))]
+    pub async fn into_dataframe(
+        mut self,
+    ) -> Result<(polars::frame::DataFrame, Option<ResultSummary>)> {
+        self.stream.into_dataframe(&mut self.connection).await
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -477,3 +596,316 @@ enum State {
     Ready,
     Complete(Option<BoxedSummary>),
 }
+
+// mod pl {{{
+#[cfg(feature = "polars_v0_43")]
+mod pl {
+    use polars::{
+        chunked_array::metadata::MetadataCollectable,
+        error::PolarsError as Error,
+        frame::DataFrame,
+        prelude::{
+            BinaryChunkedBuilder, BooleanChunkedBuilder, ChunkedBuilder as _, Float64Type,
+            Int64Type, PlSmallStr, PrimitiveChunkedBuilder, StringChunkedBuilder,
+        },
+        series::{IntoSeries, Series},
+    };
+
+    #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
+    use crate::{bolt::BoltRef, Result};
+
+    #[derive(Clone)]
+    pub(super) struct DataBuf {
+        fields: Vec<PlSmallStr>,
+        buffers: Vec<ColBuf2>,
+        chunk_size: usize,
+    }
+
+    impl DataBuf {
+        pub(super) fn new<S: Into<PlSmallStr>>(
+            chunk_size: usize,
+            fields: impl IntoIterator<Item = S>,
+        ) -> Self {
+            let fields = fields.into_iter().map(Into::into).collect::<Vec<_>>();
+            let buffers = vec![ColBuf2::new(); fields.len()];
+            Self {
+                fields,
+                buffers,
+                chunk_size,
+            }
+        }
+
+        pub(super) fn push(&mut self, values: Vec<BoltRef<'_>>) -> Result<()> {
+            assert_eq!(values.len(), self.fields.len());
+            for (buf, value) in self.buffers.iter_mut().zip(values) {
+                buf.push(self.chunk_size, value)?;
+            }
+            Ok(())
+        }
+
+        pub(super) fn flush(&mut self) -> Result<(), Error> {
+            for buf in &mut self.buffers {
+                buf.flush(self.chunk_size)?;
+            }
+            Ok(())
+        }
+
+        pub(super) fn into_df(self) -> Result<DataFrame, polars::error::PolarsError> {
+            let serieses = self
+                .buffers
+                .into_iter()
+                .zip(self.fields.into_iter())
+                .map(|(buf, field)| buf.into_series(field))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            DataFrame::new(serieses)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ColBuf2 {
+        builder: ColBuilder,
+        series: Option<Series>,
+    }
+
+    #[derive(Clone)]
+    enum ColBuilder {
+        Int(PrimitiveChunkedBuilder<Int64Type>),
+        Float(PrimitiveChunkedBuilder<Float64Type>),
+        Boolean(BooleanChunkedBuilder),
+        String(StringChunkedBuilder),
+        Binary(BinaryChunkedBuilder),
+        Null(usize),
+    }
+
+    impl ColBuilder {
+        fn new() -> Self {
+            Self::Null(0)
+        }
+
+        fn push(&mut self, chunk_size: usize, value: BoltRef<'_>) -> Result<()> {
+            match value {
+                BoltRef::Null => {
+                    match self {
+                        ColBuilder::Int(b) => b.append_null(),
+                        ColBuilder::Float(b) => b.append_null(),
+                        ColBuilder::Boolean(b) => b.append_null(),
+                        ColBuilder::String(b) => b.append_null(),
+                        ColBuilder::Binary(b) => b.append_null(),
+                        ColBuilder::Null(ref mut count) => *count += 1,
+                    };
+                    Ok(())
+                }
+                BoltRef::Boolean(v) => {
+                    match self {
+                        ColBuilder::Int(b) => b.append_value(v.into()),
+                        ColBuilder::Float(b) => b.append_value(v.into()),
+                        ColBuilder::Boolean(b) => b.append_value(v),
+                        ColBuilder::String(b) => b.append_value(if v { "true" } else { "false" }),
+                        ColBuilder::Binary(b) => b.append_value(if v { &[1] } else { &[0] }),
+                        ColBuilder::Null(count) => {
+                            let mut b = BooleanChunkedBuilder::new(PlSmallStr::EMPTY, chunk_size);
+                            for _ in 0..*count {
+                                b.append_null();
+                            }
+                            b.append_value(v);
+                            *self = Self::Boolean(b);
+                        }
+                    };
+                    Ok(())
+                }
+                BoltRef::Integer(v) => {
+                    match self {
+                        ColBuilder::Int(b) => b.append_value(v),
+                        ColBuilder::Float(b) => b.append_value(v as f64),
+                        ColBuilder::Boolean(b) => b.append_value(v != 0),
+                        ColBuilder::String(b) => b.append_value(format!("{}", v)),
+                        ColBuilder::Binary(b) => b.append_value(v.to_be_bytes()),
+                        ColBuilder::Null(count) => {
+                            let mut b = PrimitiveChunkedBuilder::<Int64Type>::new(
+                                PlSmallStr::EMPTY,
+                                chunk_size,
+                            );
+                            for _ in 0..*count {
+                                b.append_null();
+                            }
+                            b.append_value(v);
+                            *self = Self::Int(b);
+                        }
+                    };
+                    Ok(())
+                }
+                BoltRef::Float(v) => {
+                    match self {
+                        ColBuilder::Int(b) => b.append_value(v as i64),
+                        ColBuilder::Float(b) => b.append_value(v),
+                        ColBuilder::Boolean(b) => b.append_value(v.is_finite() && v != 0.0),
+                        ColBuilder::String(b) => b.append_value(format!("{}", v)),
+                        ColBuilder::Binary(b) => b.append_value(v.to_be_bytes()),
+                        ColBuilder::Null(count) => {
+                            let mut b = PrimitiveChunkedBuilder::<Float64Type>::new(
+                                PlSmallStr::EMPTY,
+                                chunk_size,
+                            );
+                            for _ in 0..*count {
+                                b.append_null();
+                            }
+                            b.append_value(v);
+                            *self = Self::Float(b);
+                        }
+                    };
+                    Ok(())
+                }
+                BoltRef::Bytes(v) => {
+                    match self {
+                        ColBuilder::Int(b) => b.append_value(
+                            std::str::from_utf8(v)
+                                .map_err(|_| crate::Error::ConversionError)?
+                                .parse()
+                                .map_err(|_| crate::Error::ConversionError)?,
+                        ),
+                        ColBuilder::Float(b) => b.append_value(
+                            std::str::from_utf8(v)
+                                .map_err(|_| crate::Error::ConversionError)?
+                                .parse()
+                                .map_err(|_| crate::Error::ConversionError)?,
+                        ),
+                        ColBuilder::Boolean(b) => b.append_value(
+                            std::str::from_utf8(v)
+                                .map_err(|_| crate::Error::ConversionError)?
+                                .parse()
+                                .map_err(|_| crate::Error::ConversionError)?,
+                        ),
+                        ColBuilder::String(b) => b.append_value(
+                            std::str::from_utf8(v).map_err(|_| crate::Error::ConversionError)?,
+                        ),
+                        ColBuilder::Binary(b) => b.append_value(v),
+                        ColBuilder::Null(count) => {
+                            let mut b = BinaryChunkedBuilder::new(PlSmallStr::EMPTY, chunk_size);
+                            for _ in 0..*count {
+                                b.append_null();
+                            }
+                            b.append_value(v);
+                            *self = Self::Binary(b);
+                        }
+                    };
+                    Ok(())
+                }
+                BoltRef::String(v) => {
+                    match self {
+                        ColBuilder::Int(b) => {
+                            b.append_value(v.parse().map_err(|_| crate::Error::ConversionError)?)
+                        }
+                        ColBuilder::Float(b) => {
+                            b.append_value(v.parse().map_err(|_| crate::Error::ConversionError)?)
+                        }
+                        ColBuilder::Boolean(b) => {
+                            b.append_value(v.parse().map_err(|_| crate::Error::ConversionError)?)
+                        }
+                        ColBuilder::String(b) => b.append_value(v),
+                        ColBuilder::Binary(b) => b.append_value(v.as_bytes()),
+                        ColBuilder::Null(count) => {
+                            let mut b = StringChunkedBuilder::new(PlSmallStr::EMPTY, chunk_size);
+                            for _ in 0..*count {
+                                b.append_null();
+                            }
+                            b.append_value(v);
+                            *self = Self::String(b);
+                        }
+                    };
+                    Ok(())
+                }
+                BoltRef::List(_) => todo!(),
+                BoltRef::Dictionary(_) => todo!(),
+                BoltRef::Node(_) => todo!(),
+                BoltRef::Relationship(_) => todo!(),
+                BoltRef::Path(_) => todo!(),
+                BoltRef::Date(_) => todo!(),
+                BoltRef::Time(_) => todo!(),
+                BoltRef::LocalTime(_) => todo!(),
+                BoltRef::DateTime(_) => todo!(),
+                BoltRef::DateTimeZoneId(_) => todo!(),
+                BoltRef::LocalDateTime(_) => todo!(),
+                BoltRef::Duration(_) => todo!(),
+                BoltRef::Point2D(_) => todo!(),
+                BoltRef::Point3D(_) => todo!(),
+                BoltRef::LegacyDateTime(_) => todo!(),
+                BoltRef::LegacyDateTimeZoneId(_) => todo!(),
+            }
+        }
+
+        fn finish(&mut self, chunk_size: usize) -> Series {
+            match self {
+                ColBuilder::Int(b) => {
+                    let b = std::mem::replace(
+                        b,
+                        PrimitiveChunkedBuilder::<Int64Type>::new(PlSmallStr::EMPTY, chunk_size),
+                    );
+                    b.finish().with_cheap_metadata().into_series()
+                }
+                ColBuilder::Float(b) => {
+                    let b = std::mem::replace(
+                        b,
+                        PrimitiveChunkedBuilder::<Float64Type>::new(PlSmallStr::EMPTY, chunk_size),
+                    );
+                    b.finish().with_cheap_metadata().into_series()
+                }
+                ColBuilder::Boolean(b) => {
+                    let b = std::mem::replace(
+                        b,
+                        BooleanChunkedBuilder::new(PlSmallStr::EMPTY, chunk_size),
+                    );
+                    b.finish().into_series()
+                }
+                ColBuilder::String(b) => {
+                    let b = std::mem::replace(
+                        b,
+                        StringChunkedBuilder::new(PlSmallStr::EMPTY, chunk_size),
+                    );
+                    b.finish().into_series()
+                }
+                ColBuilder::Binary(b) => {
+                    let b = std::mem::replace(
+                        b,
+                        BinaryChunkedBuilder::new(PlSmallStr::EMPTY, chunk_size),
+                    );
+                    b.finish().into_series()
+                }
+                ColBuilder::Null(count) => {
+                    let count = std::mem::replace(count, 0);
+                    Series::new_null(PlSmallStr::EMPTY, count)
+                }
+            }
+        }
+    }
+
+    impl ColBuf2 {
+        fn new() -> Self {
+            Self {
+                builder: ColBuilder::new(),
+                series: None,
+            }
+        }
+
+        fn push(&mut self, chunk_size: usize, value: BoltRef<'_>) -> Result<()> {
+            self.builder.push(chunk_size, value)
+        }
+
+        fn flush(&mut self, chunk_size: usize) -> Result<(), Error> {
+            let chunk = self.builder.finish(chunk_size);
+            if let Some(series) = &mut self.series {
+                series.append(&chunk)?;
+            } else {
+                self.series = Some(chunk);
+            }
+
+            Ok(())
+        }
+
+        fn into_series(mut self, name: PlSmallStr) -> Result<Series, Error> {
+            self.flush(0)?;
+            Ok(self.series.unwrap().with_name(name))
+        }
+    }
+}
+// }}}

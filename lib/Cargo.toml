@@ -13,10 +13,12 @@ documentation = "https://docs.rs/neo4rs"
 readme = "../README.md"
 keywords = ["neo4j", "driver", "bolt", "cypher", "tokio"]
 categories = ["database", "network-programming", "asynchronous"]
-rust-version = "1.75.0"
+rust-version = "1.80.0"
 
 [features]
 json = ["serde_json"]
+polars = ["polars_v0_43"]
+polars_v0_43 = ["dep:polars"]
 unstable-v1 = ["unstable-bolt-protocol-impl-v2", "unstable-result-summary"]
 unstable-serde-packstream-format = []
 unstable-result-summary = ["unstable-serde-packstream-format"]
@@ -62,6 +64,11 @@ version = "0.26.0"
 default-features = false
 features = ["tls12", "ring"]
 
+[dependencies.polars]
+version = "0.43.0"
+default-features = false
+optional = true
+features = ["rows"]
 
 [dev-dependencies]
 pretty_env_logger = "0.5.0"

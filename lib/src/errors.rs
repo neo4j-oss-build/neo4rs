@@ -24,6 +24,10 @@ pub enum Error {
     #[error(transparent)]
     ParseError(#[from] de::Error),
 
+    #[cfg(feature = "polars_v0_43")]
+    #[error(transparent)]
+    Polars(#[from] polars::error::PolarsError),
+
     #[error("Unsupported URI scheme: {0}")]
     UnsupportedScheme(String),
 

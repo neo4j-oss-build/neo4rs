@@ -20,7 +20,7 @@ on:
 
 env:
   RUSTUP_TOOLCHAIN: stable
-  MSRV: 1.75.0
+  MSRV: 1.80.0
 
 jobs:
   make-release-pr:

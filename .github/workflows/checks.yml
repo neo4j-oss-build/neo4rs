@@ -23,7 +23,7 @@ on:
 env:
   RUST_LOG: debug
   CARGO_TERM_COLOR: always
-  MSRV: 1.75.0
+  MSRV: 1.80.0
   HACK: hack --package neo4rs --each-feature --exclude-features unstable-serde-packstream-format,unstable-bolt-protocol-impl-v2,unstable-result-summary
 
 jobs:
